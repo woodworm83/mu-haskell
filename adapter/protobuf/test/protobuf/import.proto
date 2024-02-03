@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package imports;
+
+message Message {
+  MessageA a = 1;
+  oneof union {
+    MessageB b = 2;
+    MessageC c = 3;
+  }
+  Enum e = 4;
+  Nested nested = 5;
+
+  message Nested {
+    string value = 1;
+  }
+}
+
+message MessageA {
+  string text = 1;
+}
+
+message MessageB {
+  string text = 1;
+}
+
+message MessageC {
+  string text = 1;
+}
+
+enum Enum {
+  Value1 = 0;
+  Value2 = 1;
+}

@@ -4,6 +4,7 @@
 {-# language NamedFieldPuns    #-}
 {-# language OverloadedStrings #-}
 {-# language TemplateHaskell   #-}
+{-# language ViewPatterns      #-}
 {-|
 Description : Quasi-quoters for Protocol Buffers schemas
 
@@ -16,19 +17,22 @@ module Mu.Quasi.ProtoBuf (
     protobuf
   -- * Only for internal use
   , protobufToDecls
+  , loadImports
   ) where
 
-import           Control.Monad                   (when)
+import           Control.Monad                   (foldM, when)
 import           Control.Monad.IO.Class
 import qualified Data.ByteString                 as B
 import           Data.Int
 import qualified Data.List                       as L
-import           Data.List.NonEmpty              (NonEmpty (..))
+import           Data.List.NonEmpty              (NonEmpty (..), toList)
+import qualified Data.Map.Strict                 as M
 import qualified Data.Text                       as T
 import           Data.Word
 import           Language.Haskell.TH
 import           Language.ProtocolBuffers.Parser
 import qualified Language.ProtocolBuffers.Types  as P
+import           System.FilePath                 (takeDirectory, (</>))
 
 import           Mu.Adapter.ProtoBuf
 import           Mu.Schema.Annotations
@@ -44,13 +48,31 @@ protobuf schemaName fp
          Left e
            -> fail ("could not parse protocol buffers spec: " ++ show e)
          Right p
-           -> protobufToDecls schemaName p
+           -> protobufToDecls schemaName p =<< loadImports fp p
+
+loadImports :: FilePath -> P.ProtoBuf -> Q [P.ProtoBuf]
+loadImports rootFp p = M.elems <$> loadImports' M.empty rootFp p
+  where
+    loadImports' :: M.Map FilePath P.ProtoBuf -> FilePath -> P.ProtoBuf -> Q (M.Map FilePath P.ProtoBuf)
+    loadImports' m fp p' = foldM (loadImport fp) m $ P.imports p'
+    loadImport :: FilePath -> M.Map FilePath P.ProtoBuf -> (P.ImportType, T.Text) -> Q (M.Map FilePath P.ProtoBuf)
+    loadImport parentFp m (_, relFP) = do
+      let fp = takeDirectory parentFp </> T.unpack relFP
+      if fp `M.member` m
+        then pure m
+        else do
+          r <- liftIO $ parseProtoBufFile fp
+          case r of
+            Left e -> do
+              reportError $ "Include " <> fp <> " of " <> parentFp <> " not found: " <> show e
+              pure m
+            Right proto -> loadImports' (M.insert fp proto m) fp proto
 
 -- | Shared portion of Protocol Buffers and gRPC quasi-quoters.
-protobufToDecls :: String -> P.ProtoBuf -> Q [Dec]
-protobufToDecls schemaName p
+protobufToDecls :: String -> P.ProtoBuf -> [P.ProtoBuf] -> Q [Dec]
+protobufToDecls schemaName p imps
   = do let schemaName' = mkName schemaName
-       (schTy, annTy) <- schemaFromProtoBuf p
+       (schTy, annTy) <- schemaFromProtoBuf p imps
        schemaDec <- tySynD schemaName' [] (pure schTy)
 #if MIN_VERSION_template_haskell(2,15,0)
        annDec <- tySynInstD (tySynEqn Nothing
@@ -62,20 +84,29 @@ protobufToDecls schemaName p
 #endif
        pure [schemaDec, annDec]
 
-schemaFromProtoBuf :: P.ProtoBuf -> Q (Type, Type)
-schemaFromProtoBuf P.ProtoBuf {P.types = tys} = do
-  let decls = flattenDecls (("", tys) :| []) tys
+schemaFromProtoBuf :: P.ProtoBuf -> [P.ProtoBuf] -> Q (Type, Type)
+schemaFromProtoBuf P.ProtoBuf {P.types = tys} imps = do
+  let decls = flattenDecls (("", tys) :| []) tys <> flattenImportDecls imps
   (schTys, anns) <- unzip <$> mapM (pbTypeDeclToType $ shouldOptional decls) decls
   pure (typesToList schTys, typesToList (concat anns))
   where
     shouldOptional :: [P.TypeDeclaration] -> P.TypeName -> Bool
-    shouldOptional [] _ = error "this should never happen"
+    shouldOptional [] this = error $ T.unpack $ "no declaration for type " <> T.intercalate "." this
     shouldOptional (P.DMessage nm _ _ _ _ : _) this
       | nm == last this = True
     shouldOptional (P.DEnum nm _ _ : _) this
       | nm == last this = False
     shouldOptional (_ : rest) this
       = shouldOptional rest this
+
+flattenImportDecls :: [P.ProtoBuf] -> [P.TypeDeclaration]
+flattenImportDecls = concatMap flattenImportDecls'
+  where
+    flattenImportDecls' :: P.ProtoBuf -> [P.TypeDeclaration]
+    flattenImportDecls' P.ProtoBuf { P.types = tys, P.package = getPackageName -> pkg } =
+      flattenDecls ((pkg, tys) :| []) tys
+    getPackageName :: Maybe P.FullIdentifier -> T.Text
+    getPackageName = maybe "" (T.intercalate ".")
 
 flattenDecls :: NonEmpty (P.Identifier, [P.TypeDeclaration]) -> [P.TypeDeclaration] -> [P.TypeDeclaration]
 flattenDecls (currentScope :| higherScopes) = concatMap flattenDecl
@@ -84,7 +115,7 @@ flattenDecls (currentScope :| higherScopes) = concatMap flattenDecl
     flattenDecl (P.DMessage name o r fs decls) =
       let newScopeName = prependCurrentScope name
           newScopes = (newScopeName, decls) :| (currentScope : higherScopes)
-      in P.DMessage newScopeName o r (scopeFieldType newScopes <$> fs) [] : flattenDecls newScopes decls
+      in P.DMessage newScopeName o r (scopeFieldType (toList newScopes) <$> fs) [] : flattenDecls newScopes decls
 
     scopeFieldType scopes (P.NormalField frep ftype fname fnum fopts) =
       P.NormalField frep (qualifyType scopes ftype) fname fnum fopts
@@ -95,17 +126,15 @@ flattenDecls (currentScope :| higherScopes) = concatMap flattenDecl
     qualifyType scopes (P.TOther ts) = P.TOther (qualifyTOther scopes ts)
     qualifyType _scopes t            = t
 
-    qualifyTOther _scopes [] = error "This shouldn't be possible"
-    qualifyTOther ((_, _) :| []) ts =
-      [T.intercalate "." ts] -- Top level scope, no need to search anything, use
-                             -- the name as is. Maybe we should search and fail
-                             -- if a type is not found even from top level, but
-                             -- that could be a lot of work as this function is
-                             -- pure right now.
-    qualifyTOther ((scopeName, decls) :| (restFirst : restTail)) ts =
+    qualifyTOther _ [] = error "This shouldn't be possible"
+    qualifyTOther [] ts = [T.intercalate "." ts]
+    qualifyTOther ((scopeName, decls) : rest) ts =
       if L.any (hasDeclFor ts) decls
-      then [T.intercalate "." (scopeName:ts)]
-      else qualifyTOther (restFirst :| restTail) ts
+      then [qualifyName scopeName ts]
+      else qualifyTOther rest ts
+      where
+        qualifyName "" ts' = T.intercalate "." ts'
+        qualifyName sn ts'=qualifyName "" (sn:ts')
 
     hasDeclFor [] _ = True
     hasDeclFor [t] (P.DEnum enumName _ _) = t == enumName
@@ -120,7 +149,7 @@ flattenDecls (currentScope :| higherScopes) = concatMap flattenDecl
     prependCurrentScope x =
       case fst currentScope of
         "" -> x
-        _  -> fst currentScope <> "." <> x
+        sn -> sn <> "." <> x
 
 pbTypeDeclToType :: (P.TypeName -> Bool) -> P.TypeDeclaration -> Q (Type, [Type])
 pbTypeDeclToType _ (P.DEnum name _ fields) = do
@@ -179,7 +208,7 @@ pbTypeDeclToType shouldOptional (P.DMessage name _ _ fields _) = do
     pbFieldTypeToType P.TBool      = [t|'TPrimitive Bool|]
     pbFieldTypeToType P.TString    = [t|'TPrimitive T.Text|]
     pbFieldTypeToType P.TBytes     = [t|'TPrimitive B.ByteString|]
-    pbFieldTypeToType (P.TOther t) = [t|'TSchematic $(textToStrLit (last t))|]
+    pbFieldTypeToType (P.TOther t) = [t|'TSchematic $(textToStrLit (T.intercalate "." t))|]
 
     hasFieldNumber P.NormalField {} = True
     hasFieldNumber P.MapField {}    = True

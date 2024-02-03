@@ -10,7 +10,7 @@ and a set of 'Service's.
 -}
 module Mu.Quasi.GRpc (
   grpc
-) where
+  ) where
 
 import           Control.Monad.IO.Class
 import qualified Data.Text                       as T
@@ -35,12 +35,12 @@ grpc schemaName servicePrefix fp
          Left e
            -> fail ("could not parse protocol buffers spec: " ++ show e)
          Right p
-           -> grpcToDecls schemaName servicePrefix p
+           -> grpcToDecls schemaName servicePrefix p =<< loadImports fp p
 
-grpcToDecls :: String -> (String -> String) -> P.ProtoBuf -> Q [Dec]
-grpcToDecls schemaName servicePrefix p@P.ProtoBuf { P.package = pkg, P.services = srvs }
+grpcToDecls :: String -> (String -> String) -> P.ProtoBuf -> [P.ProtoBuf] -> Q [Dec]
+grpcToDecls schemaName servicePrefix p@P.ProtoBuf { P.package = pkg, P.services = srvs } imps
   = do let schemaName' = mkName schemaName
-       schemaDec <- protobufToDecls schemaName p
+       schemaDec <- protobufToDecls schemaName p imps
        serviceTy <- mapM (pbServiceDeclToDec servicePrefix pkg schemaName') srvs
        pure (schemaDec ++ serviceTy)
 

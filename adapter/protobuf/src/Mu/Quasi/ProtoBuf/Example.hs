@@ -12,9 +12,11 @@ module Mu.Quasi.ProtoBuf.Example where
 import           Mu.Quasi.ProtoBuf
 
 #if __GHCIDE__
-protobuf "ExampleProtoBufSchema"  "adapter/protobuf/test/protobuf/example.proto"
-protobuf "Example2ProtoBufSchema" "adapter/protobuf/test/protobuf/example2.proto"
+protobuf "ExampleProtoBufSchema"            "adapter/protobuf/test/protobuf/example.proto"
+protobuf "Example2ProtoBufSchema"           "adapter/protobuf/test/protobuf/example2.proto"
+protobuf "ExampleWithImportsProtoBufSchema" "adapter/protobuf/test/protobuf/exampleWithImports.proto"
 #else
-protobuf "ExampleProtoBufSchema"  "test/protobuf/example.proto"
-protobuf "Example2ProtoBufSchema" "test/protobuf/example2.proto"
+protobuf "ExampleProtoBufSchema"            "test/protobuf/example.proto"
+protobuf "Example2ProtoBufSchema"           "test/protobuf/example2.proto"
+protobuf "ExampleWithImportsProtoBufSchema" "test/protobuf/exampleWithImports.proto"
 #endif
